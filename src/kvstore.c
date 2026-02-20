@@ -157,17 +157,23 @@ static int parse_resp(char *msg, int len, char *tokens[], int maxtok) {
         argc = argc * 10 + (*p - '0');
         p++;
     }
-    if (p == num_start) return -1;            // no digits after '*'
-    if (p >= end || *p != '\r') return -1;
+    if (p == num_start) return -1;  // 确实没有数字，格式错误
+    
+    // 关键修改：如果已经到结尾，返回 0 表示需要更多数据
+    if (p >= end) return 0;
+    if (*p != '\r') return -1;
     p++;
-    if (p >= end || *p != '\n') return -1;
+    if (p >= end) return 0;
+    if (*p != '\n') return -1;
     p++;
 
     if (argc > maxtok) return -1;
 
     for (int i = 0; i < argc; i++) {
-        if (p >= end || *p != '$') return -1;
-        p++;  // skip '$'
+        // 检查 $ 前缀
+        if (p >= end) return 0;
+        if (*p != '$') return -1;
+        p++;
 
         // Parse bulk string length
         int blen = 0;
@@ -176,14 +182,16 @@ static int parse_resp(char *msg, int len, char *tokens[], int maxtok) {
             blen = blen * 10 + (*p - '0');
             p++;
         }
-        if (p == blen_start) return -1;       // no digits after '$'
-        if (p >= end || *p != '\r') return -1;
+        if (p == blen_start) return -1;
+        if (p >= end) return 0;
+        if (*p != '\r') return -1;
         p++;
-        if (p >= end || *p != '\n') return -1;
+        if (p >= end) return 0;
+        if (*p != '\n') return -1;
         p++;
 
-        // Check if bulk string data is complete
-        if (p + blen + 2 > end) return 0;     // incomplete
+        // 检查数据是否完整
+        if (p + blen + 2 > end) return 0;
 
         tokens[i] = kvs_malloc(blen + 1);
         if (!tokens[i]) {
@@ -195,7 +203,7 @@ static int parse_resp(char *msg, int len, char *tokens[], int maxtok) {
         }
         memcpy(tokens[i], p, blen);
         tokens[i][blen] = '\0';
-        p += blen + 2;                         // skip data and trailing \r\n
+        p += blen + 2;
     }
     return p - msg;
 }

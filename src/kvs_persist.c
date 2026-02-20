@@ -17,7 +17,7 @@ void kvs_persist_init(const char *aof_filename, const char *rdb_filename) {
     memset(&g_persist_config, 0, sizeof(g_persist_config));
     
     /* RDB config */
-    g_persist_config.rdb.save_interval = 300;      /* 1 minutes */
+    g_persist_config.rdb.save_interval = 300;      /* 5 minutes */
     g_persist_config.rdb.min_changes = 100;        /* at least 100 writes */
     g_persist_config.rdb.save_on_shutdown = true;
     g_persist_config.rdb.last_save_time = time(NULL);
