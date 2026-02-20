@@ -20,7 +20,8 @@ kvs_replication_t g_repl = {
 
 int kvs_replication_handle_master_read(int fd);
 static void kvs_replication_send_full_sync(int slave_fd);
-static void kvs_replication_send_key_value(const char *key, const char *value, void *arg);
+static void kvs_replication_send_key_value(const void *key, size_t key_len, 
+                                          const void *val, size_t val_len, void *arg);
 static void kvs_replication_execute_command(const char *cmdline);
 static void kvs_replication_reconnect(void);
 static int  kvs_connect_master(const char *ip, int port);
@@ -66,21 +67,49 @@ void kvs_replication_add_slave(int fd) {
     kvs_replication_send_full_sync(fd);
 }
 
-static void kvs_replication_send_key_value(const char *key, const char *value, void *arg) {
+/* 全量同步回调：发送单个键值对（二进制安全） */
+static void kvs_replication_send_key_value(const void *key, size_t key_len, 
+                                          const void *val, size_t val_len, void *arg) {
     int fd = *(int*)arg;
     char buf[2048];
-    int len = snprintf(buf, sizeof(buf), "SET %s %s\r\n", key, value);
-    if (len > 0 && (size_t)len < sizeof(buf)) {
-        send(fd, buf, len, 0);
+    int pos = 0;
+    
+    // 构造 *3\r\n$3\r\nSET\r\n
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "*3\r\n$3\r\nSET\r\n");
+    
+    // 构造 $<key_len>\r\n<key>\r\n
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "$%zu\r\n", key_len);
+    if (pos + key_len + 2 <= sizeof(buf)) {
+        memcpy(buf + pos, key, key_len);
+        pos += key_len;
+        buf[pos++] = '\r';
+        buf[pos++] = '\n';
+    }
+    
+    // 构造 $<val_len>\r\n<val>\r\n
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "$%zu\r\n", val_len);
+    if (pos + val_len + 2 <= sizeof(buf)) {
+        memcpy(buf + pos, val, val_len);
+        pos += val_len;
+        buf[pos++] = '\r';
+        buf[pos++] = '\n';
+    }
+    
+    if (pos > 0 && pos < (int)sizeof(buf)) {
+        send(fd, buf, pos, 0);
     }
 }
 
+/* 全量同步：遍历哈希表并发送 SET 命令 */
 static void kvs_replication_send_full_sync(int slave_fd) {
     send(slave_fd, "+FULLSYNC\r\n", 12, 0);
-    kvs_hash_foreach(&global_hash, kvs_replication_send_key_value, &slave_fd);
+    kvs_hash_foreach(&global_hash, 
+                     (void (*)(const void *, size_t, const void *, size_t, void *))kvs_replication_send_key_value, 
+                     &slave_fd);
     send(slave_fd, "+OK\r\n", 5, 0);
 }
 
+/* 命令传播 - 保持原有格式，使用文本协议 */
 void kvs_replication_feed_slaves(char *cmd, char *key, char *value) {
     if (g_repl.role != KVS_ROLE_MASTER) {
         return;
@@ -178,6 +207,7 @@ int kvs_replication_handle_master_read(int fd) {
     return 0;
 }
 
+/* 从机执行写命令（支持二进制安全） */
 static void kvs_replication_execute_command(const char *cmdline) {
     char copy[256];
     strncpy(copy, cmdline, sizeof(copy)-1);
@@ -189,9 +219,9 @@ static void kvs_replication_execute_command(const char *cmdline) {
         return;
     }
     if (strcasecmp(cmd, "SET") == 0) {
-        kvs_hash_set(&global_hash, key, val ? val : "");
+        kvs_hash_set(&global_hash, key, strlen(key), val ? val : "", val ? strlen(val) : 0);
     } else if (strcasecmp(cmd, "DEL") == 0) {
-        kvs_hash_del(&global_hash, key);
+        kvs_hash_del(&global_hash, key, strlen(key));
     }
 }
 

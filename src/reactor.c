@@ -10,26 +10,117 @@
 #include <sys/time.h>
 #include <stdlib.h>
 #include <signal.h>
-#include <sys/timerfd.h>           // 新增：用于定时器
+#include <sys/timerfd.h>
 
 #include "../include/server.h"
 #include "../include/kvs_replication.h"
-#include "../include/kvs_persist.h" // 新增：用于 AOF 重写检查
+#include "../include/kvs_persist.h"
+#include "../include/kvs_base.h"
 
-
-#define CONNECTION_SIZE			1024
 #define MAX_PORTS			1
 #define TIME_SUB_MS(tv1, tv2)  ((tv1.tv_sec - tv2.tv_sec) * 1000 + (tv1.tv_usec - tv2.tv_usec) / 1000)
 
 static struct conn conn_list[CONNECTION_SIZE] = {0};
 
 #if ENABLE_KVSTORE
-typedef int (*msg_handler)(char *msg, int length, char *response, int *processed);
+// 修改消息处理函数类型，支持缓冲区大小和需要空间
+/* typedef int (*msg_handler)(char *msg, int length, char *response, int resp_size,  */
+/*                           int *processed, int *needed); */
 static msg_handler kvs_handler;
+
+/* 扩容读缓冲区 */
+static int expand_rbuffer(struct conn *c, int needed) {
+    int new_capacity = c->rcapacity;
+    
+    // 确保至少能容纳 needed 字节
+    while (new_capacity - c->rlength < needed) {
+        new_capacity *= 2;
+        // 防止无限循环（最大限制）
+        if (new_capacity > 128 * 1024 * 1024) {  // 128MB 上限
+            printf("Read buffer too large for fd=%d\n", c->fd);
+            return -1;
+        }
+    }
+    
+    char *new_buf = (char*)kvs_realloc(c->rbuffer, new_capacity);
+    if (!new_buf) {
+        printf("Failed to expand read buffer for fd=%d to %d bytes\n", 
+               c->fd, new_capacity);
+        return -1;
+    }
+    
+    c->rbuffer = new_buf;
+    c->rcapacity = new_capacity;
+    
+#ifdef DEBUG
+    printf("Expanded read buffer for fd=%d from %d to %d bytes\n", 
+           c->fd, c->rcapacity/2, new_capacity);
+#endif
+    return 0;
+}
+
+/* 扩容写缓冲区 */
+static int expand_wbuffer(struct conn *c, int needed) {
+    int new_capacity = c->wcapacity;
+    
+    // 确保至少能容纳 needed 字节
+    while (new_capacity - c->wlength < needed) {
+        new_capacity *= 2;
+        // 防止无限循环（最大限制）
+        if (new_capacity > 128 * 1024 * 1024) {  // 128MB 上限
+            printf("Write buffer too large for fd=%d\n", c->fd);
+            return -1;
+        }
+    }
+    
+    char *new_buf = (char*)kvs_realloc(c->wbuffer, new_capacity);
+    if (!new_buf) {
+        printf("Failed to expand write buffer for fd=%d to %d bytes\n", 
+               c->fd, new_capacity);
+        return -1;
+    }
+    
+    c->wbuffer = new_buf;
+    c->wcapacity = new_capacity;
+    
+#ifdef DEBUG
+    printf("Expanded write buffer for fd=%d from %d to %d bytes\n", 
+           c->fd, c->wcapacity/2, new_capacity);
+#endif
+    return 0;
+}
 
 int kvs_request(struct conn *c) {
     int processed = 0;
-    c->wlength = kvs_handler(c->rbuffer, c->rlength, c->wbuffer, &processed);
+    int needed = 0;
+    
+    // 调用协议处理函数
+    int resp_len = kvs_handler(c->rbuffer, c->rlength, 
+                                c->wbuffer + c->wlength,
+                                c->wcapacity - c->wlength,
+                                &processed, &needed);
+    
+    if (resp_len == -2) {
+        // 需要更大的写缓冲区
+#ifdef DEBUG
+        printf("[DEBUG] Need to expand write buffer for fd=%d, needed=%d\n", c->fd, needed);
+#endif
+        if (expand_wbuffer(c, needed) < 0) {
+            return -1;
+        }
+        // 扩容后重新尝试处理同一条命令
+        return kvs_request(c);
+    }
+    
+    if (resp_len > 0) {
+        c->wlength += resp_len;
+    }
+    
+    if (resp_len < 0 && resp_len != -2) {
+        printf("[ERROR] Protocol error on fd=%d\n", c->fd);
+        return -1;
+    }
+    
     return 0;
 }
 
@@ -42,11 +133,10 @@ int kvs_response(struct conn *c) {
 int accept_cb(int fd);
 int recv_cb(int fd);
 int send_cb(int fd);
-static int timer_cb(int fd);      // 新增：定时器回调声明
+static int timer_cb(int fd);
 
 int epfd = 0;
 struct timeval begin;
-
 
 /* 确保 epfd 已初始化 */
 static void ensure_epfd(void) {
@@ -78,17 +168,25 @@ int set_event(int fd, int event, int flag) {
     return 0;
 }
 
+/* 动态分配连接缓冲区 */
 int event_register(int fd, int event) {
-    if (fd < 0) return -1;
+    if (fd < 0 || fd >= CONNECTION_SIZE) return -1;
 
     conn_list[fd].fd = fd;
     conn_list[fd].r_action.recv_callback = recv_cb;
     conn_list[fd].send_callback = send_cb;
 
-    memset(conn_list[fd].rbuffer, 0, BUFFER_LENGTH);
+    // 分配初始读缓冲区
+    conn_list[fd].rbuffer = (char*)kvs_malloc(INIT_BUFFER_SIZE);
+    conn_list[fd].rcapacity = INIT_BUFFER_SIZE;
     conn_list[fd].rlength = 0;
-    memset(conn_list[fd].wbuffer, 0, BUFFER_LENGTH);
+    memset(conn_list[fd].rbuffer, 0, INIT_BUFFER_SIZE);
+
+    // 分配初始写缓冲区
+    conn_list[fd].wbuffer = (char*)kvs_malloc(INIT_BUFFER_SIZE);
+    conn_list[fd].wcapacity = INIT_BUFFER_SIZE;
     conn_list[fd].wlength = 0;
+    memset(conn_list[fd].wbuffer, 0, INIT_BUFFER_SIZE);
 
     set_event(fd, event, 1);
     return 0;
@@ -127,17 +225,24 @@ int accept_cb(int fd) {
     return 0;
 }
 
+
+
+
 int recv_cb(int fd) {
-    int cur_len = conn_list[fd].rlength;
-    int remaining = BUFFER_LENGTH - cur_len;
-    if (remaining <= 0) {
-        printf("Buffer full, closing fd=%d\n", fd);
-        close(fd);
-        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-        return -1;
+    struct conn *c = &conn_list[fd];
+    int remaining = c->rcapacity - c->rlength;
+    
+    // 如果剩余空间不足 4KB，尝试扩容
+    if (remaining < 4096) {
+        if (expand_rbuffer(c, 4096) < 0) {
+            close(fd);
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+            return -1;
+        }
+        remaining = c->rcapacity - c->rlength;
     }
 
-    int count = recv(fd, conn_list[fd].rbuffer + cur_len, remaining, 0);
+    int count = recv(fd, c->rbuffer + c->rlength, remaining, 0);
     if (count == 0) {
 #ifdef DEBUG
         printf("client disconnect: %d\n", fd);
@@ -146,63 +251,107 @@ int recv_cb(int fd) {
         epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
         return 0;
     } else if (count < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;  // 非阻塞模式下无数据可读
+        }
         printf("recv error: %d, %s\n", errno, strerror(errno));
         close(fd);
         epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
         return -1;
     }
 
-    cur_len += count;
-    conn_list[fd].rlength = cur_len;
-
+    c->rlength += count;
     int total_processed = 0;
+
     while (1) {
         int processed = 0;
-        int resp_len = kvs_handler(conn_list[fd].rbuffer + total_processed,
-                                    cur_len - total_processed,
-                                    conn_list[fd].wbuffer,
-                                    &processed);
+        int needed = 0;
+        
+        // 调用协议处理函数
+        int resp_len = kvs_handler(c->rbuffer + total_processed,
+                                   c->rlength - total_processed,
+                                   c->wbuffer + c->wlength,
+                                   c->wcapacity - c->wlength,
+                                   &processed, &needed);
+        
+        if (resp_len == -2) {
+            // 需要更大的写缓冲区
+            if (expand_wbuffer(c, needed) < 0) {
+                close(fd);
+                epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+                return -1;
+            }
+            // 扩容后重新处理同一条命令（不增加 total_processed）
+            continue;
+        }
+        
         if (resp_len < 0) {
-            // 修复：去掉多余的一层 if
             printf("[ERROR] Protocol error on fd=%d, resetting buffer\n", fd);
-            conn_list[fd].rlength = 0;
+            c->rlength = 0;
             break;
         }
+        
         if (processed == 0) {
-            break;
+            break;  // 数据不足，等待更多
         }
-        conn_list[fd].wlength = resp_len;
-        set_event(fd, EPOLLOUT, 0);
+
+        c->wlength += resp_len;
         total_processed += processed;
     }
 
+    // 处理已处理的数据
     if (total_processed > 0) {
-        if (total_processed < cur_len) {
-            memmove(conn_list[fd].rbuffer,
-                    conn_list[fd].rbuffer + total_processed,
-                    cur_len - total_processed);
-            conn_list[fd].rlength = cur_len - total_processed;
+        if (total_processed < c->rlength) {
+            memmove(c->rbuffer, c->rbuffer + total_processed, c->rlength - total_processed);
+            c->rlength -= total_processed;
         } else {
-            conn_list[fd].rlength = 0;
+            c->rlength = 0;
         }
+    }
+
+    // 如果有响应数据，注册写事件
+    if (c->wlength > 0) {
+        set_event(fd, EPOLLOUT, 0);
     }
     return count;
 }
 
 int send_cb(int fd) {
+    struct conn *c = &conn_list[fd];
+
 #if ENABLE_HTTP
-    http_response(&conn_list[fd]);
+    http_response(c);
 #elif ENABLE_WEBSOCKET
-    ws_response(&conn_list[fd]);
+    ws_response(c);
 #elif ENABLE_KVSTORE
-    kvs_response(&conn_list[fd]);
+    kvs_response(c);
 #endif
 
     int count = 0;
-    if (conn_list[fd].wlength != 0) {
-        count = send(fd, conn_list[fd].wbuffer, conn_list[fd].wlength, 0);
+    if (c->wlength > 0) {
+        count = send(fd, c->wbuffer, c->wlength, 0);
+        if (count > 0) {
+            // 移动未发送的数据到缓冲区开头
+            if (count < c->wlength) {
+                memmove(c->wbuffer, c->wbuffer + count, c->wlength - count);
+                c->wlength -= count;
+            } else {
+                c->wlength = 0;
+            }
+        } else if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            printf("send error on fd=%d: %s\n", fd, strerror(errno));
+            close(fd);
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+            return -1;
+        }
     }
-    set_event(fd, EPOLLIN, 0);
+
+    // 如果还有未发送数据，继续监听写事件；否则切回读事件
+    if (c->wlength > 0) {
+        set_event(fd, EPOLLOUT, 0);
+    } else {
+        set_event(fd, EPOLLIN, 0);
+    }
     return count;
 }
 
@@ -224,9 +373,7 @@ int r_init_server(unsigned short port) {
     return sockfd;
 }
 
-/*--------------------------------------------------------------------------
- * 供复制模块使用的读事件注册/注销接口
- *--------------------------------------------------------------------------*/
+/* 供复制模块使用的读事件注册/注销接口 */
 void event_register_read(int fd, int (*handler)(int)) {
     if (fd < 0 || fd >= CONNECTION_SIZE) {
         fprintf(stderr, "[EVENT] event_register_read: invalid fd %d\n", fd);
@@ -239,10 +386,15 @@ void event_register_read(int fd, int (*handler)(int)) {
     conn_list[fd].r_action.recv_callback = handler;
     conn_list[fd].send_callback = NULL;
 
-    memset(conn_list[fd].rbuffer, 0, BUFFER_LENGTH);
+    conn_list[fd].rbuffer = (char*)kvs_malloc(INIT_BUFFER_SIZE);
+    conn_list[fd].rcapacity = INIT_BUFFER_SIZE;
     conn_list[fd].rlength = 0;
-    memset(conn_list[fd].wbuffer, 0, BUFFER_LENGTH);
+    memset(conn_list[fd].rbuffer, 0, INIT_BUFFER_SIZE);
+
+    conn_list[fd].wbuffer = (char*)kvs_malloc(INIT_BUFFER_SIZE);
+    conn_list[fd].wcapacity = INIT_BUFFER_SIZE;
     conn_list[fd].wlength = 0;
+    memset(conn_list[fd].wbuffer, 0, INIT_BUFFER_SIZE);
 
     set_event(fd, EPOLLIN, 1);
 #ifdef DEBUG
@@ -259,6 +411,16 @@ void event_unregister_read(int fd) {
         epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
     }
 
+    // 释放动态分配的缓冲区
+    if (conn_list[fd].rbuffer) {
+        kvs_free(conn_list[fd].rbuffer);
+        conn_list[fd].rbuffer = NULL;
+    }
+    if (conn_list[fd].wbuffer) {
+        kvs_free(conn_list[fd].wbuffer);
+        conn_list[fd].wbuffer = NULL;
+    }
+
     conn_list[fd].fd = -1;
     conn_list[fd].r_action.recv_callback = NULL;
     conn_list[fd].send_callback = NULL;
@@ -268,24 +430,19 @@ void event_unregister_read(int fd) {
 #endif
 }
 
-/*--------------------------------------------------------------------------
- * 新增：定时器回调函数，每秒触发一次，检查 AOF 是否需要重写
- *--------------------------------------------------------------------------*/
+/* 定时器回调 */
 static int timer_cb(int fd) {
     uint64_t exp;
-    // 读取定时器事件，必须消耗掉，否则会一直触发
     ssize_t s = read(fd, &exp, sizeof(exp));
     if (s != sizeof(exp)) {
-        // 可能出错，忽略
+        // ignore
     }
-    // 调用持久化模块的检查函数
     kvs_aof_check_and_rewrite();
     kvs_rdb_check_and_save();
     return 0;
 }
 
 int reactor_start(unsigned short port, msg_handler handler) {
-    // 忽略 SIGPIPE，防止向已关闭的 socket 写入时进程退出
     signal(SIGPIPE, SIG_IGN);
 
     kvs_handler = handler;
@@ -300,21 +457,20 @@ int reactor_start(unsigned short port, msg_handler handler) {
         set_event(sockfd, EPOLLIN, 1);
     }
 
-    // 创建定时器，用于定期检查 AOF 重写
+    // 创建定时器
     int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     if (tfd < 0) {
         perror("timerfd_create");
     } else {
         struct itimerspec its;
-        its.it_interval.tv_sec = 1;    // 间隔 1 秒
+        its.it_interval.tv_sec = 1;
         its.it_interval.tv_nsec = 0;
-        its.it_value.tv_sec = 1;        // 第一次触发在 1 秒后
+        its.it_value.tv_sec = 1;
         its.it_value.tv_nsec = 0;
         if (timerfd_settime(tfd, 0, &its, NULL) == 0) {
-            // 将定时器 fd 加入 epoll 监听
             event_register_read(tfd, timer_cb);
 #ifdef DEBUG
-            printf("[EVENT] Timer fd=%d registered for AOF rewrite check\n", tfd);
+            printf("[EVENT] Timer fd=%d registered\n", tfd);
 #endif
         } else {
             perror("timerfd_settime");

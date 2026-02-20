@@ -3,6 +3,11 @@
 
 #include <stddef.h>
 
+
+/* Message handler type for protocol processing */
+typedef int (*msg_handler)(char *msg, int length, char *response, int resp_size, 
+                          int *processed, int *needed);
+
 /* Memory allocation wrappers */
 void *kvs_malloc(size_t size);
 void kvs_free(void *ptr);
@@ -14,7 +19,7 @@ void kvs_mp_destory(void);
 void kvs_mp_stats(void);  
 
 #define KVS_MAX_TOKENS 128
-#define KVS_MAX_MSG_LEN 1024
+#define KVS_MAX_MSG_LEN (1024 * 1024)
 #define BUFFER_LENGTH (2 * 1024 * 1024)  
 
 #define ENABLE_JEMALLOC 0

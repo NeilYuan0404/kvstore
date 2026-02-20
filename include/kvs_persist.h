@@ -4,7 +4,9 @@
 #include "kvs_hash.h"
 #include <stdbool.h>
 
-extern int kvs_protocol(char *msg, int length, char *response, int *processed);
+// extern int kvs_protocol(char *msg, int length, char *response, int *processed);
+
+extern int kvs_protocol(char *msg, int length, char *response, int resp_size, int *processed, int *needed);
 
 /* configuration of aof and rdb */
 typedef struct {

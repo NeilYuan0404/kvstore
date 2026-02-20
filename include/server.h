@@ -1,36 +1,37 @@
 #ifndef __SERVER_H__
 #define __SERVER_H__
 
-#define BUFFER_LENGTH		1024
+#define INIT_BUFFER_SIZE    (64 * 1024)    // 初始64KB，可动态扩容
+#define CONNECTION_SIZE      256             // 最大连接数
 
-#define ENABLE_HTTP			0
-#define ENABLE_WEBSOCKET	0
-#define ENABLE_KVSTORE		1
-
+#define ENABLE_HTTP          0
+#define ENABLE_WEBSOCKET     0
+#define ENABLE_KVSTORE       1
 
 typedef int (*RCALLBACK)(int fd);
 
-
 struct conn {
-	int fd;
+    int fd;
+    
+    char *rbuffer;      // 动态分配的读缓冲区
+    int rlength;        // 当前数据长度
+    int rcapacity;      // 缓冲区总容量
+    
+    char *wbuffer;      // 动态分配的写缓冲区
+    int wlength;        // 待发送数据长度
+    int wcapacity;      // 缓冲区总容量
 
-	char rbuffer[BUFFER_LENGTH];
-	int rlength;
+    RCALLBACK send_callback;
 
-	char wbuffer[BUFFER_LENGTH];
-	int wlength;
+    union {
+        RCALLBACK recv_callback;
+        RCALLBACK accept_callback;
+    } r_action;
 
-	RCALLBACK send_callback;
-
-	union {
-		RCALLBACK recv_callback;
-		RCALLBACK accept_callback;
-	} r_action;
-
-	int status;
+    int status;
 #if 1 // websocket
-	char *payload;
-	char mask[4];
+    char *payload;
+    char mask[4];
 #endif
 };
 
@@ -47,12 +48,6 @@ int ws_response(struct conn *c);
 #if ENABLE_KVSTORE
 int kvs_request(struct conn *c);
 int kvs_response(struct conn *c);
-
 #endif
 
-
-
-
 #endif
-
-

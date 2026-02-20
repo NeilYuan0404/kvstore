@@ -23,9 +23,21 @@ enum {
     CMD_HSET, CMD_HGET, CMD_HDEL, CMD_HMOD, CMD_HEXIST, CMD_SAVE, CMD_COUNT
 };
 
-typedef int (*msg_handler)(char *msg, int length, char *response, int *processed);
-extern int reactor_start(unsigned short port, msg_handler handler);
+/* typedef int (*msg_handler)(char *msg, int length, char *response, int *processed); */
+extern int reactor_start(unsigned short port, 
+                        int (*handler)(char *msg, int length, char *response, 
+                                      int resp_size, int *processed, int *needed));
 extern bool g_is_loading;
+
+/* Helper: append bulk string to response buffer */
+static int append_bulk_string(char *resp, const void *data, size_t len) {
+    int n = sprintf(resp, "$%zu\r\n", len);
+    memcpy(resp + n, data, len);
+    n += len;
+    resp[n++] = '\r';
+    resp[n++] = '\n';
+    return n;
+}
 
 /*--------------------------------------------------------------------------
  * Command executor with replication and AOF persistence
@@ -55,10 +67,12 @@ int kvs_executor(char **tokens, int count, char *response) {
     char *key = count > 1 ? tokens[1] : NULL;
     char *val = count > 2 ? tokens[2] : NULL;
     int ret, len = 0;
+    size_t key_len = key ? strlen(key) : 0;
+    size_t val_len = val ? strlen(val) : 0;
 
     switch (cmd) {
     case CMD_HSET:
-        ret = kvs_hash_set(&global_hash, key, val);
+        ret = kvs_hash_set(&global_hash, key, key_len, val, val_len);
         if (ret < 0)
             len = sprintf(response, "-ERR internal error\r\n");
         else if (ret == 0) {
@@ -75,9 +89,10 @@ int kvs_executor(char **tokens, int count, char *response) {
         break;
 
     case CMD_HGET: {
-        char *res = kvs_hash_get(&global_hash, key);
+        size_t res_len;
+        void *res = kvs_hash_get(&global_hash, key, key_len, &res_len);
         if (res) {
-            len = sprintf(response, "$%d\r\n%s\r\n", (int)strlen(res), res);
+            len = append_bulk_string(response, res, res_len);
         } else {
             len = sprintf(response, "$-1\r\n");  // Null bulk string
         }
@@ -85,7 +100,7 @@ int kvs_executor(char **tokens, int count, char *response) {
     }
 
     case CMD_HDEL:
-        ret = kvs_hash_del(&global_hash, key);
+        ret = kvs_hash_del(&global_hash, key, key_len);
         if (ret < 0)
             len = sprintf(response, "-ERR internal error\r\n");
         else if (ret == 0) {
@@ -102,7 +117,7 @@ int kvs_executor(char **tokens, int count, char *response) {
         break;
 
     case CMD_HMOD:
-        ret = kvs_hash_mod(&global_hash, key, val);
+        ret = kvs_hash_mod(&global_hash, key, key_len, val, val_len);
         if (ret < 0)
             len = sprintf(response, "-ERR internal error\r\n");
         else if (ret == 0) {
@@ -119,7 +134,7 @@ int kvs_executor(char **tokens, int count, char *response) {
         break;
 
     case CMD_HEXIST:
-        ret = kvs_hash_exist(&global_hash, key);
+        ret = kvs_hash_exist(&global_hash, key, key_len);
         len = (ret == 0) ? sprintf(response, ":1\r\n") : sprintf(response, ":0\r\n");
         break;
 
@@ -210,27 +225,30 @@ static int parse_resp(char *msg, int len, char *tokens[], int maxtok) {
 
 /* Main protocol entry: only RESP format is accepted.
  * Processes as many complete commands as possible from the input buffer.
- * Returns total response length (always >= 0), and sets *processed to number of bytes consumed.
- * If a protocol error occurs, returns -1 (caller should close connection).
+ * Returns:
+ *   >0: actual response length written (if response buffer was large enough)
+ *    0: need more data
+ *   -1: protocol error
+ * If response buffer is too small, returns -2 and sets *needed to required size.
  */
-// 在文件开头添加外部变量声明
-
-
-int kvs_protocol(char *msg, int length, char *response, int *processed) {
-    if (!msg || !response || !processed) return -1;
+int kvs_protocol(char *msg, int length, char *response, int resp_size, int *processed, int *needed) {
+    if (!msg || !response || !processed || !needed) return -1;
     if (length <= 0) return 0;
+    
     char *p = msg;
     int remain = length;
     int total = 0;
     char *resp = response;
+    int resp_remain = resp_size;
     *processed = 0;
+    *needed = 0;
 
 #ifdef DEBUG
     int cmd_count = 0;
 #endif
 
     while (remain > 0) {
-        // 跳过空白字符（如 \r, \n, 空格等），避免空行导致误判
+        // 跳过空白字符
         while (remain > 0 && isspace(*p)) {
             p++;
             remain--;
@@ -238,20 +256,19 @@ int kvs_protocol(char *msg, int length, char *response, int *processed) {
         }
         if (remain <= 0) break;
 
-        // 如果不是 '*'，说明协议可能出错，尝试找到下一个 '*' 以恢复同步
+        // 重新同步逻辑
         if (*p != '*') {
             char *next_star = memchr(p, '*', remain);
             if (next_star) {
                 int junk = next_star - p;
 #ifdef DEBUG
-                printf("[DEBUG] Protocol resync: skipping %d bytes of non-RESP data\n", junk);
+                printf("[DEBUG] Protocol resync: skipping %d bytes\n", junk);
 #endif
                 p = next_star;
                 remain -= junk;
                 *processed += junk;
-                continue;   // 重新开始循环
+                continue;
             } else {
-                // 没有找到 '*'，可能是数据错误或数据不足，等待更多数据
                 break;
             }
         }
@@ -261,30 +278,55 @@ int kvs_protocol(char *msg, int length, char *response, int *processed) {
         if (consumed > 0) {
             int tokcnt = 0;
             while (tokcnt < KVS_MAX_TOKENS && tokens[tokcnt]) tokcnt++;
+            
+            // **关键修改：先计算响应长度，但不写入**
+            // 使用一个临时缓冲区计算长度
+            char *temp = kvs_malloc(64 * 1024);
+            if (!temp) {
+                // 处理内存分配失败
+                for (int i = 0; i < tokcnt; i++) {
+                    if (tokens[i]) kvs_free(tokens[i]);
+                }
+                return -1;
+            }
+            int resp_len = kvs_executor(tokens, tokcnt, temp);
+            kvs_free(temp);
+            
+            if (resp_len > resp_remain) {
+                // 缓冲区太小，记录需要的空间
+                *needed = resp_len;
+                // 释放 tokens
+                for (int i = 0; i < tokcnt; i++) {
+                    if (tokens[i]) kvs_free(tokens[i]);
+                }
+                return -2;  // 需要更大的缓冲区
+            }
+            
+            // 缓冲区足够，真正执行并写入
 #ifdef DEBUG
             cmd_count++;
 #endif
-            int resp_len = kvs_executor(tokens, tokcnt, resp);
+            resp_len = kvs_executor(tokens, tokcnt, resp);
             for (int i = 0; i < tokcnt; i++) {
                 if (tokens[i]) kvs_free(tokens[i]);
             }
+            
             if (resp_len > 0) {
                 resp += resp_len;
+                resp_remain -= resp_len;
                 total += resp_len;
             }
+            
             p += consumed;
             remain -= consumed;
             *processed += consumed;
 
-            // 在AOF重放模式下，只处理一条命令就返回
             if (g_is_loading) {
                 break;
             }
         } else if (consumed == 0) {
-            // 数据不足，等待更多
             break;
         } else {
-            // 解析错误，尝试跳过当前行（直到遇到 '\n'）然后继续
 #ifdef DEBUG
             printf("[DEBUG] Parse error, skipping line\n");
 #endif
@@ -294,9 +336,8 @@ int kvs_protocol(char *msg, int length, char *response, int *processed) {
                 p += skip;
                 remain -= skip;
                 *processed += skip;
-                // 继续下一轮循环
+                continue;
             } else {
-                // 没有找到换行，等待更多数据
                 break;
             }
         }
@@ -306,7 +347,6 @@ int kvs_protocol(char *msg, int length, char *response, int *processed) {
     printf("[DEBUG] Protocol processed %d commands, total response %d bytes\n", cmd_count, total);
 #endif
 
-    if (total > 0) *resp = '\0';
     return total;
 }
 /*--------------------------------------------------------------------------
@@ -324,7 +364,7 @@ void dest_kvengine(void) {
 #ifdef DEBUG
     printf("[DEBUG] Destroying KV engine\n");
 #endif
-    kvs_hash_destory(&global_hash);
+    kvs_hash_destroy(&global_hash);
 }
 
 /*--------------------------------------------------------------------------
@@ -372,7 +412,6 @@ int main(int argc, char *argv[]) {
 
     dest_kvengine();
 
-    kvs_mp_destory();  
     return 0;
 }
 #endif
